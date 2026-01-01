@@ -44,6 +44,7 @@ Options:
   -d, --voicedata     show voice data lists
   -l, --long          long listing format (one line per name or parameter)
   -p NUM, --patch NUM show voice data list of patch number NUM
+  -r NUM --newname NAME rename NUM voice name to NAME
   -f, --formfeed      use form-feed instead of patch separator line
   --fix               try to fix corrupt files
                         creates a backup of the original file (*.ORIG)
