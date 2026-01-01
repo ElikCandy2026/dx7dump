@@ -1,20 +1,24 @@
 /*! \file dx7dump.cpp
  *  \brief Yamaha DX7 Sysex Dump.
- *  
+ *
  *  Copyright 2012, Ted Felix
  *  Modifications 2024 by Bernhard Lex
  *  License: GPLv3+
- * 
+ *
  *  Takes a Yamaha DX7 voice-bank sysex file and formats it as human readable text.
  *  The format is also conducive to using diff (or meld) to examine differences
  *  between patches.
- * 
+ *
  *  Based on info from:
  *  http://homepages.abdn.ac.uk/mth192/pages/dx7/sysex-format.txt
- * 
+ *
  *  Build:
  *    g++ -o dx7dump dx7dump.cpp
- * 
+ *
+ *  Updates by Elik Candy:
+ * 	2026-01-01: Option -r (--rename numvoice) implemented
+ * 				--newname newvoicename
+ *
  *  Updates by B.Lex:
  *  2024-03-17: Options -n and -o implemented
  *  2023-02-16: Option -p implemented
@@ -31,6 +35,7 @@
  *
  */
 
+#include <cstddef>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -43,7 +48,7 @@
 #include "dx7algorithms.h"
 
 // disable to use 7-bit ASCII LCD translation
-#define USE_UNICODE_DEFAULT         // ASCII or UNICODE to be used for displaying LCD content 
+#define USE_UNICODE_DEFAULT         // ASCII or UNICODE to be used for displaying LCD content
 
 // compile with table variant 1 or 2
 #define TABLE_VARIANT 2
@@ -52,7 +57,6 @@
 
 //! program version
 const char *version = "1.03b";
-
 
 //! sysex file-size of a dx7 bank-dump
 const unsigned sysexSize = 4104;
@@ -89,6 +93,11 @@ bool findDupes = false;
 //! set by option "-p" to specify patch number; -1 means all.
 int patch = -1;
 
+//! set by option "-r" to specify patch number for renaming
+int renameNum = -1;
+unsigned char renameName[10];
+bool renameVoice = false;
+
 //! set by option "--fix": try to fix corrupted files
 bool fixFiles = false;
 
@@ -101,7 +110,7 @@ bool askToFix = true;
 //! set by option "-no-backup": don't create backups when fixing files
 bool noBackup = false;
 
-#ifdef USE_UNICODE_DEFAULT  
+#ifdef USE_UNICODE_DEFAULT
 #define USE_UNICODE true
 #else
 #define USE_UNICODE false
@@ -133,7 +142,7 @@ bool singleVoiceFile = false;
 //! set by option "-f" to use form-feed instead of separator line
 bool formfeed = false;
 
-//! printable voice-name in ASCII or UNICODE 
+//! printable voice-name in ASCII or UNICODE
 char name[41];      // max. length required for unicode
 //char name[11];        // max. length required for ASCII only
 
@@ -194,7 +203,7 @@ const char lcdTableAscii[] = {
     'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '>', '<',   // 0x70
 };
 
-//! help-text  
+//! help-text
 const char usageText[] = {
     "Usage: dx7dump [OPTIONS] FILE\n"
 };
@@ -204,6 +213,7 @@ const char optionsText[] = {
     "  -d, --voicedata     show voice data lists\n"
     "  -l, --long          long listing format (one line per name or parameter)\n"
     "  -p NUM, --patch NUM show voice data list of patch number NUM\n"
+    "  -r NUM --newname NAME rename NUM voice name to NAME\n"
     "  -f, --formfeed      use form-feed instead of patch separator line\n"
     "  --fix               try to fix corrupt files\n"
     "                        creates a backup of the original file (*.ORIG)\n"
@@ -432,7 +442,7 @@ const char *OnOff(unsigned x)
 {
     if (x > 1)
         return OutOfRange();
-        
+
     const char *onOff[] = { "Off", "On" };
     return onOff[x];
 }
@@ -502,7 +512,7 @@ const char *Mode(unsigned x)
 const char *Note(unsigned x)
 {
     x = x % 12;
-    const char *notes[] = 
+    const char *notes[] =
         { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
     return notes[x];
 }
@@ -533,14 +543,14 @@ std::string Breakpoint(unsigned x)
 {
     if (x > 99)
         return OutOfRange();
-        
+
     char buffer[10];
 
     // Playing some tricks (add 12 tones, subtract one octave) to avoid
     // the fact that -3/12 rounds to 0 and messes everything up.  Shifting
     // everything up an octave and then subtracting one solves the problem.
     const int octave = ((int)x - 3 + 12) / 12 - 1;
-    
+
     // Anything's better than sstream!
     snprintf(buffer, 9, "%s%d", Note(x + 9), octave);
 
@@ -561,9 +571,9 @@ std::string Frequency(OperatorPacked op)
         double coarse = op.frequencyCoarse;
         if (coarse == 0)
             coarse = .5;
-    
+
         const double freq = coarse + ((double)op.frequencyFine * coarse / 100);
-        
+
         sprintf(buffer, "%g", freq);
     }
     else  // fixed mode
@@ -593,6 +603,7 @@ void processOpts(int *argc, char ***argv)
         { "patch", 1, 0, 'p' },
         { "formfeed", 0, 0, 'f' },
         { "fix", 0, 0, 'F' },
+        { "newname", 1, 0, 'N' },
         { "yes", 0, 0, 'y' },
         { "plain-names", 0, 0, 'n' },
         { "no-backup", 0, 0, 'K' },
@@ -607,16 +618,17 @@ void processOpts(int *argc, char ***argv)
         { "unicode", 0, 0, 'u' },
 #define ENCODE_ARG "u"
 #endif
+		{ "rename", 1, 0, 'r' },
         { NULL, 0, 0, 0 },
     };
-  
+
     for (;;)
     {
-        int i = getopt_long(*argc, *argv, "dlDp:fynexvoh" ENCODE_ARG, opts, NULL);
+        int i = getopt_long(*argc, *argv, "dlDp:fynexvohr:" ENCODE_ARG, opts, NULL);
         if (i == -1)
             break;
-          
-        switch (i) 
+
+        switch (i)
         {
         case 'd':
             voiceDataList = true;
@@ -632,11 +644,24 @@ void processOpts(int *argc, char ***argv)
             patch--;
             voiceDataList = true;
             break;
+        case 'r':
+        	renameVoice = true;
+            renameNum = strtol(optarg, NULL, 0);
+            renameNum--;
+            break;
         case 'f':
             formfeed = true;
             break;
         case 'x':
             showHex = true;
+            break;
+        case 'N':  // --newname (long option only)
+            int i;
+            i = 0;
+            while(i<10 && optarg[i] != '\0'){
+            	renameName[i] = optarg[i];
+             	i++;
+            }
             break;
         case 'F':  // --fix (long option only)
             fixFiles = true;
@@ -657,7 +682,7 @@ void processOpts(int *argc, char ***argv)
         case 'a':
             useUnicode = false;
             break;
-#else     
+#else
         case 'u':
             useUnicode = true;
             break;
@@ -679,7 +704,7 @@ void processOpts(int *argc, char ***argv)
             break;
         }
     }
-  
+
     // Bump to the end of the options.
     *argc -= optind;
     *argv += optind;
@@ -858,7 +883,7 @@ void UnpackVoice(VoiceUnpacked *uVoice, const VoicePacked *pVoice)
 int Verify(const DX7Sysex *sysex)
 {
     // *** Verify Header and Footer ***
-    
+
     if (sysex->sysexBeginF0 != 0xF0)
     {
         sprintf(msgBuffer, "Did not find sysex start F0\n");
@@ -872,7 +897,7 @@ int Verify(const DX7Sysex *sysex)
     // only checking subStatus, but not Channel
     if (sysex->subStatusAndChannel & 0xF0 != 0)
     {
-        sprintf(msgBuffer, "Did not find substatus 0. (substatus=%d)\n", 
+        sprintf(msgBuffer, "Did not find substatus 0. (substatus=%d)\n",
             (sysex->subStatusAndChannel & 0xF0) >> 4);
         fixNeeded = true;
         // return 1;
@@ -885,7 +910,7 @@ int Verify(const DX7Sysex *sysex)
     }
     if (sysex->sizeMSB != 0x20  ||  sysex->sizeLSB != 0)
     {
-        sprintf(msgBuffer, "WARNING: Declared data byte count is not 4096. (sizeMSB=0x%X, sizeLSB=0x%X)\n", 
+        sprintf(msgBuffer, "WARNING: Declared data byte count is not 4096. (sizeMSB=0x%X, sizeLSB=0x%X)\n",
             sysex->sizeMSB, sysex->sizeLSB);
         fixNeeded = true;
         //return 1;
@@ -896,7 +921,7 @@ int Verify(const DX7Sysex *sysex)
         return 1;
     }
 
-    // verify checksum 
+    // verify checksum
     unsigned char sum = Checksum(sysex);
     if (sum != sysex->checksum)
     {
@@ -904,7 +929,7 @@ int Verify(const DX7Sysex *sysex)
         fixNeeded = true;
         //return 1;
     }
-    
+
     return 0;
 }
 
@@ -935,11 +960,11 @@ int VerifySingle(const DX7SingleSysex *sysex)
     // we are not checking checksum here
     if (sysex->sysexEndF7 != 0xF7)
         error += 1;
-        
+
     //printf("ERROR: 0x%2.2X\n", error);   // DEBUG
 
     if (!error){
-        // verify checksum 
+        // verify checksum
         unsigned char sum = ChecksumSingle(&sysex->voice, sizeof(VoiceUnpacked));
         //printf("CHECKSUM: calculated=0x%2.2X  file=0x%2.2X\n", sum, sysex->checksum);   // DEBUG
         if (sum != sysex->checksum)
@@ -952,14 +977,14 @@ int VerifySingle(const DX7SingleSysex *sysex)
         // basic check passed
         return 0;
     }
-        
+
     return 1;
 }
 
 // ***************************************************************************
 
 /*! set global vertical line character for UNICODE or ASCII
- */ 
+ */
 void setVertLineChar()
 {
     if (useUnicode)
@@ -1055,7 +1080,7 @@ void Name2Ascii(char *nameAscii, const unsigned char *nameLcd)
     if (useUnicode)
     {
         // convert characters from LCD to Unicode
-        nameAscii[0] = 0; 
+        nameAscii[0] = 0;
         for (unsigned i = 0; i < 10; i++)
         {
             strcat(nameAscii, lcdTableUnicode[int(nameLcd[i])]);
@@ -1064,7 +1089,7 @@ void Name2Ascii(char *nameAscii, const unsigned char *nameLcd)
     else
     {
         // convert characters from LCD to ASCII
-        //nameAscii = ""; 
+        //nameAscii = "";
         for (unsigned i = 0; i < 10; i++)
         {
             nameAscii[i] = lcdTableAscii[int(nameLcd[i])];
@@ -1123,7 +1148,7 @@ void Format(const DX7Sysex *sysex, const char *filename)
             {
                 rows = 16;
                 columns = 2;
-            }   
+            }
         }
         else if (!showHex)
         {
@@ -1148,15 +1173,15 @@ void Format(const DX7Sysex *sysex, const char *filename)
                 {
                     for (unsigned i = 0; i < 10; i++)
                     {
-                        printf(" %2.2X", voice->name[i]);          
+                        printf(" %2.2X", voice->name[i]);
                     }
                 }
                 if (column < columns - 1)
                     printf("         ");
             }
-            puts("");          
+            puts("");
         }
-        puts("");          
+        puts("");
     }
     else    // voice data listing
     {
@@ -1179,9 +1204,9 @@ void Format(const DX7Sysex *sysex, const char *filename)
             if (patch == -1 or patch == voiceNum)
             {
                 const VoicePacked *voice = &(sysex->voices[voiceNum]);
-          
+
                 // Voice Data List
-          
+
                 PrintFilename(filename);
                 printf("Voice-#: %d\n", voiceNum + 1);
                 Name2Ascii(name, voice->name);
@@ -1192,22 +1217,22 @@ void Format(const DX7Sysex *sysex, const char *filename)
                     printf(" | ");
                     for (unsigned i = 0; i < 10; i++)
                     {
-                        printf(" %2.2X", voice->name[i]);          
+                        printf(" %2.2X", voice->name[i]);
                     }
 
                     // print single voice raw data
                     VoiceUnpacked unpackedVoice;
                     VoiceUnpacked *uVoice = &unpackedVoice;
                     UnpackVoice(uVoice, voice);
-                    printf("\n\nVoice Data:"); 
+                    printf("\n\nVoice Data:");
                     //char* uVoiceChar = reinterpret_cast<char*>(&unpackedVoice);
                     unsigned char* uVoiceChar = (unsigned char*)(&unpackedVoice);
                     for (unsigned i = 0; i < sizeof(unpackedVoice); i++)
                     {
-                        printf(" %2.2X", uVoiceChar[i]);    
+                        printf(" %2.2X", uVoiceChar[i]);
                     }
-                    //printf(" [ChkSum:%2.2X]", ChecksumSingle(uVoice, sizeof(unpackedVoice)));    
-                    printf(" %2.2X [last byte = checksum]", ChecksumSingle(uVoice, sizeof(unpackedVoice)));    
+                    //printf(" [ChkSum:%2.2X]", ChecksumSingle(uVoice, sizeof(unpackedVoice)));
+                    printf(" %2.2X [last byte = checksum]", ChecksumSingle(uVoice, sizeof(unpackedVoice)));
                 }
 
                 puts("\n");
@@ -1233,7 +1258,7 @@ void Format(const DX7Sysex *sysex, const char *filename)
                         printf("+------------+-------+-------+------------+--------+\n");
                     printf("%1$s            %1$s Algo- %1$s Feed- %1$s Oscillator "
                            "%1$s Trans- %1$s\n", vl);
-                    
+
                     printf("%1$s Voice Name %1$s rithm %1$s back  %1$s Key Sync   "
                            "%1$s pose   %1$s\n", vl);
                     if (useUnicode)
@@ -1308,7 +1333,7 @@ void Format(const DX7Sysex *sysex, const char *filename)
                     if (!useUnicode)
                         puts("");
 
-#else   
+#else
                     // TABLE_VARIANT 1
 
                     // +------------+-------+-------+------------+-------------------------------+--------+
@@ -1408,7 +1433,7 @@ void Format(const DX7Sysex *sysex, const char *filename)
                     char rateScale[120] = "";
                     char outputLevel[120] = "";
                     char keyVelSens[120] = "";
-                    
+
                     // prepare table row data for each operator
                     for (unsigned i = 0; i < 6; ++i)
                     {
@@ -1416,42 +1441,42 @@ void Format(const DX7Sysex *sysex, const char *filename)
                         const unsigned j = 5 - i;
                         const OperatorPacked &op = voice->op[j];
 
-                        sprintf(tableHeader + strlen(tableHeader), 
+                        sprintf(tableHeader + strlen(tableHeader),
                             " Operator %u %s", i + 1, vl);
-                        sprintf(ampModSens + strlen(ampModSens), 
+                        sprintf(ampModSens + strlen(ampModSens),
                             " %10u %s", op.amplitudeModulationSensitivity, vl);
-                        sprintf(oscMode + strlen(oscMode), 
+                        sprintf(oscMode + strlen(oscMode),
                             " %10s %s", Mode(op.oscillatorMode), vl);
-                        sprintf(frequency + strlen(frequency), 
+                        sprintf(frequency + strlen(frequency),
                             " %10s %s", Frequency(op).c_str(), vl);
-                        sprintf(detune + strlen(detune), 
+                        sprintf(detune + strlen(detune),
                             " %+10d %s", op.detune - 7, vl);
-                        sprintf(egR1L1 + strlen(egR1L1), 
+                        sprintf(egR1L1 + strlen(egR1L1),
                             " %4u : %-3u %s", op.EG_R1, voice->op[j].EG_L1, vl);
-                        sprintf(egR2L2 + strlen(egR2L2), 
+                        sprintf(egR2L2 + strlen(egR2L2),
                             " %4u : %-3u %s", op.EG_R2, voice->op[j].EG_L2, vl);
-                        sprintf(egR3L3 + strlen(egR3L3), 
+                        sprintf(egR3L3 + strlen(egR3L3),
                             " %4u : %-3u %s", op.EG_R3, voice->op[j].EG_L3, vl);
-                        sprintf(egR4L4 + strlen(egR4L4), 
+                        sprintf(egR4L4 + strlen(egR4L4),
                             " %4u : %-3u %s", op.EG_R4, voice->op[j].EG_L4, vl);
-                        sprintf(breakpoint + strlen(breakpoint), 
+                        sprintf(breakpoint + strlen(breakpoint),
                             " %10s %s", Breakpoint(op.levelScalingBreakPoint).c_str(), vl);
-                        sprintf(leftCurve + strlen(leftCurve), 
+                        sprintf(leftCurve + strlen(leftCurve),
                             " %10s %s", Curve(op.scaleLeftCurve), vl);
-                        sprintf(rightCurve + strlen(rightCurve), 
+                        sprintf(rightCurve + strlen(rightCurve),
                             " %10s %s", Curve(op.scaleRightCurve), vl);
-                        sprintf(leftDepth + strlen(leftDepth), 
+                        sprintf(leftDepth + strlen(leftDepth),
                             " %10u %s", op.scaleLeftDepth, vl);
-                        sprintf(rightDepth + strlen(rightDepth), 
+                        sprintf(rightDepth + strlen(rightDepth),
                             " %10u %s", op.scaleRightDepth, vl);
-                        sprintf(rateScale + strlen(rateScale), 
+                        sprintf(rateScale + strlen(rateScale),
                             " %10u %s", op.rateScale, vl);
-                        sprintf(outputLevel + strlen(outputLevel), 
+                        sprintf(outputLevel + strlen(outputLevel),
                             " %10u %s", op.outputLevel, vl);
-                        sprintf(keyVelSens + strlen(keyVelSens), 
+                        sprintf(keyVelSens + strlen(keyVelSens),
                             " %10u %s", op.keyVelocitySensitivity, vl);
                     }
-    
+
                     // print operator table
                     // operator table head
                     OpTableSeparator(TOP);
@@ -1479,13 +1504,13 @@ void Format(const DX7Sysex *sysex, const char *filename)
                     OpTableRow("Key Velocity Sens.", keyVelSens);
                     OpTableRow("Output Level", outputLevel);
                     OpTableSeparator(BOTTOM);
-    
+
                     puts("");
 
                     // don't print voice separator on last entry
                     //if (patch == -1 and voiceNum < 31)
 
-                    // don't print voice separator for a single patch 
+                    // don't print voice separator for a single patch
                     if (patch == -1)
                         VoiceSeparator();
                 }
@@ -1493,19 +1518,19 @@ void Format(const DX7Sysex *sysex, const char *filename)
                 {
                     printf("Algorithm: %u\n", voice->algorithm + 1);
                     printf("Feedback: %u\n", voice->feedback);
-              
+
                     printf("LFO\n");
                     printf("  Wave: %s\n", LFOWave(voice->lfoWave));
                     printf("  Speed: %u\n", voice->lfoSpeed);
                     printf("  Delay: %u\n", voice->lfoDelay);
                     printf("  Pitch Mod. Depth: %u\n", voice->lfoPitchModDepth);
                     printf("  Amplitude Mod. Depth: %u\n", voice->lfoAMDepth);
-                    printf("  Key Sync: %s\n", OnOff(voice->lfoSync));  
-                    printf("  Pitch Mod. Sensitivity: %u\n", 
+                    printf("  Key Sync: %s\n", OnOff(voice->lfoSync));
+                    printf("  Pitch Mod. Sensitivity: %u\n",
                            voice->lfoPitchModSensitivity);
-              
+
                     printf("Oscillator Key Sync: %s\n", OnOff(voice->oscKeySync));
-              
+
                     printf("Pitch Envelope Generator\n");
                     printf("  Rate 1: %u\n", voice->pitchEGR1);
                     printf("  Rate 2: %u\n", voice->pitchEGR2);
@@ -1515,20 +1540,20 @@ void Format(const DX7Sysex *sysex, const char *filename)
                     printf("  Level 2: %u\n", voice->pitchEGL2);
                     printf("  Level 3: %u\n", voice->pitchEGL3);
                     printf("  Level 4: %u\n", voice->pitchEGL4);
-   
+
                     //printf("Transpose: %s\n", Transpose(voice->transpose).c_str());
                     printf("Transpose: %d\n", voice->transpose - 24);
- 
+
                     // For each operator
                     for (unsigned i = 0; i < 6; ++i)
                     {
                         puts("");
                         printf("Operator: %u\n", i + 1);
-                        
+
                         // They're stored in backward order.
                         const unsigned j = 5 - i;
                         const OperatorPacked &op = voice->op[j];
-                        
+
                         printf("  Oscillator Mode: %s\n", Mode(op.oscillatorMode));
                         printf("  Frequency: %s\n", Frequency(op).c_str());
                         printf("  Detune: %+d\n", op.detune - 7);
@@ -1542,20 +1567,20 @@ void Format(const DX7Sysex *sysex, const char *filename)
                         printf("    Level 3: %u\n", op.EG_L3);
                         printf("    Level 4: %u\n", op.EG_L4);
                         printf("  Keyboard Level Scaling\n");
-                        printf("    Breakpoint: %s\n", 
+                        printf("    Breakpoint: %s\n",
                                Breakpoint(op.levelScalingBreakPoint).c_str());
                         printf("    Left Curve: %s\n", Curve(op.scaleLeftCurve));
                         printf("    Right Curve: %s\n", Curve(op.scaleRightCurve));
                         printf("    Left Depth: %u\n", op.scaleLeftDepth);
                         printf("    Right Depth: %u\n", op.scaleRightDepth);
                         printf("  Keyboard Rate Scaling: %u\n", op.rateScale);
-                        printf("  Amp Mod Sensitivity: %u\n", 
+                        printf("  Amp Mod Sensitivity: %u\n",
                                op.amplitudeModulationSensitivity);
-                        printf("  Key Velocity Sensitivity: %u\n", 
+                        printf("  Key Velocity Sensitivity: %u\n",
                                op.keyVelocitySensitivity);
                         printf("  Output Level: %u\n", op.outputLevel);
                     }
-    
+
                     // don't print any voice separator for a single patch
                     if (patch == -1)
                     {
@@ -1569,6 +1594,71 @@ void Format(const DX7Sysex *sysex, const char *filename)
             }
         }
     }
+}
+
+// ***************************************************************************
+
+/*! Rename voice in sysex files.
+ *
+ *  \param sysex a pointer to a DX7Sysex data block
+ *  \param filename a pointer to the filename
+ *  \return 0 for successful fixing the file
+ *          1 for a failed attempt to fix the file
+ */
+int RenameFile(DX7Sysex *sysex, const char *filename)
+{
+	if(renameNum >= 0 && renameNum<32){
+		printf("Voice num: %i\n",renameNum+1);
+		printf("Voice old name:");
+
+		for (size_t i = 0; i< sizeof(sysex->voices[renameNum].name); i++){
+			printf("%c", sysex->voices[renameNum].name[i] );
+		}
+		printf("\n");
+		printf("Voice new name:%s\n",renameName);
+
+		//fill old name with spaces
+		memset(sysex->voices[renameNum].name, ' ', 10);
+		//fill old name with new name
+		memcpy(sysex->voices[renameNum].name, renameName, strlen((char*)renameName));
+
+		// calculate new checksum
+		sysex->checksum = Checksum(sysex);
+
+	    if (!noBackup)
+	    {
+	        // create a backup of the sysex-file
+	        std::string backupFile;
+	        backupFile = filename;
+	        backupFile += ".ORIG";
+	        if (rename(filename, backupFile.c_str()))
+	        {
+	            printf("File could not be renamed for backup. File-fix aborted. %s\n", strerror(errno));
+	            return 1;
+	        }
+	    }
+
+	    // fix file
+	    FILE *file = fopen(filename, "wb");
+	    if (file == NULL)
+	    {
+	        printf("Can't open the file for writing: %s. %s\n", filename, strerror(errno));
+	        return 1;
+	    }
+	    if (fwrite(sysex, sysexSize, 1, file) != 1)
+	    {
+	        printf("Error writing to file: %s. %s\n", filename, strerror(errno));
+	        return 1;
+	    }
+
+		printf("\nAfter renaming: -------------------------\n");
+
+		Format(sysex, filename);
+	}
+	else
+		printf("Patch number must be in 1-32\n");
+
+    return 0;
 }
 
 // ***************************************************************************
@@ -1589,7 +1679,7 @@ void FindDupes(const DX7Sysex *sysex)
         {
             // memcmp the patches
             // Subtract 10 to remove the name from the diff.
-            int rc = memcmp(&(sysex->voices[i]), &(sysex->voices[j]), 
+            int rc = memcmp(&(sysex->voices[i]), &(sysex->voices[j]),
                             sizeof(VoicePacked) - 10);
             if (rc == 0)
             {
@@ -1677,7 +1767,7 @@ int processFile (char* filename)
         printf("File too small (%d Bytes)\n\n", fsize);
         return 1;
     }
- 
+
     if (singleVoiceFile)
     {
         // check only if it is a single voice sysex
@@ -1688,12 +1778,12 @@ int processFile (char* filename)
         {
             Name2Ascii(name, sysex->voice.name);
             printf("File is a Single Voice Dump: \"%10s\"\n\n", name);
-        }   
+        }
         else
         {
             printf("File too small (%d Bytes)\n\n", fsize);
         }
-            
+
         return 1;
     }
 
@@ -1726,6 +1816,13 @@ int processFile (char* filename)
     else if (softError)
     {
         puts("");
+    }
+
+    // Rename voice
+    if (renameVoice)
+    {
+        //printf("Renaming\n");
+        RenameFile(sysex, filename);
     }
 
     // Fix file if neccessary
@@ -1780,4 +1877,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
